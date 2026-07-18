@@ -16,18 +16,9 @@ import edge_tts
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
-# 在线音色（edge-tts）
+# 在线音色（edge-tts）—— 仅保留晓晓一个
 ONLINE_VOICES = [
-    ("晓晓 (女·自然)", "zh-CN-XiaoxiaoNeural"),
-    ("云希 (男·自然)", "zh-CN-YunxiNeural"),
-    ("云扬 (男·专业)", "zh-CN-YunyangNeural"),
-    ("晓伊 (女·温柔)", "zh-CN-XiaoyiNeural"),
-    ("云健 (男)", "zh-CN-YunjianNeural"),
-    ("辽宁-小贝 (女·方言)", "zh-CN-liaoning-XiaobeiNeural"),
-    ("陕西-小妮 (女·方言)", "zh-CN-shaanxi-XiaoniNeural"),
-    ("香港-晓曼 (女·粤语)", "zh-HK-HiuMaanNeural"),
-    ("台湾-晓臻 (女·台语)", "zh-TW-HsiaoChenNeural"),
-    ("台湾-云龙 (男·台语)", "zh-TW-YunlongNeural"),
+    ("晓晓 (在线·女声)", "zh-CN-XiaoxiaoNeural"),
 ]
 
 
@@ -44,6 +35,23 @@ def get_local_voices():
         return out
     except Exception:
         return []
+
+
+def get_local_chinese_voice():
+    """返回本机「中文」SAPI 语音 (name, id)，无则取第一个本地语音，都没有则 None。
+
+    用于把本地选项收敛为唯一一个中文系统语音，避免下拉列出一堆无关语音。
+    """
+    voices = get_local_voices()
+    if not voices:
+        return None
+    # 优先命中中文语音
+    for name, vid in voices:
+        s = (name + vid).lower()
+        if 'zh' in s or 'chs' in s or '中文' in s or 'chinese' in s:
+            return (name, vid)
+    # 没有显式中文标记时，退而取第一个可用语音
+    return voices[0]
 
 
 class BaseWorker(QThread):
@@ -208,12 +216,20 @@ class LocalWorker(BaseWorker):
         super().__init__(units, start_index)
         self.voice_id = voice_id
         self.rate_wpm = rate_wpm
+        self._paused = False
 
     def set_params(self, voice=None, rate_wpm=None):
         if voice is not None:
             self.voice_id = voice
         if rate_wpm is not None:
             self.rate_wpm = rate_wpm
+
+    def pause(self):
+        # 仅置标志，真正的 SAPI Pause 在 run() 等待循环里执行（避免跨线程调 COM）
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
 
     @staticmethod
     def _wpm_to_sapi_rate(wpm):
@@ -262,6 +278,13 @@ class LocalWorker(BaseWorker):
                 self.sig_status.emit("已停止")
                 break
 
+            # 暂停态下等待恢复，再朗读下一句
+            while self._paused and not self._stop:
+                self.msleep(80)
+            if self._stop:
+                self.sig_status.emit("已停止")
+                break
+
             # 逐句应用最新语速/音色（实时切换下一句生效）
             try:
                 voice.Rate = self._wpm_to_sapi_rate(self.rate_wpm)
@@ -279,11 +302,26 @@ class LocalWorker(BaseWorker):
 
             try:
                 voice.Speak(text, self.SPF_ASYNC)
-                # 等待本句播完，或中途停止
+                # 等待本句播完；支持中途暂停（SAPI Pause）与停止
+                paused = False
                 while True:
                     if self._stop:
                         voice.Speak("", self.SPF_PURGE)
                         break
+                    if self._paused and not paused:
+                        try:
+                            voice.Pause()
+                        except Exception:
+                            pass
+                        paused = True
+                        self.sig_status.emit("已暂停（本地）")
+                    elif not self._paused and paused:
+                        try:
+                            voice.Resume()
+                        except Exception:
+                            pass
+                        paused = False
+                        self.sig_status.emit(f"播放中（本地）{idx+1}/{total}")
                     if voice.WaitUntilDone(50):
                         break
             except Exception as e:

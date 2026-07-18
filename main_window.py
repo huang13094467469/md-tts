@@ -22,7 +22,7 @@ from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 
 from md_parser import parse_markdown, parse_to_blocks
 from markdown_render import render_markdown
-from tts_engine import TTSPlayer, ONLINE_VOICES, get_local_voices
+from tts_engine import TTSPlayer, get_local_chinese_voice
 
 
 class _Page(QWebEnginePage):
@@ -199,22 +199,18 @@ class MainWindow(QMainWindow):
     # ---------------- 音色列表 ----------------
     def _init_voices(self):
         self.cb_voice.clear()
-        self.cb_voice.addItem("── 在线（需联网）──")
-        self._disable_item(self.cb_voice.count() - 1)
-        for label, vid in ONLINE_VOICES:
-            self.cb_voice.addItem(label, {'engine': 'online', 'id': vid})
-
-        locals_ = get_local_voices()
-        self.cb_voice.addItem("── 本地系统（离线）──")
-        self._disable_item(self.cb_voice.count() - 1)
-        if locals_:
-            for name, vid in locals_:
-                self.cb_voice.addItem(name, {'engine': 'local', 'id': vid})
+        # 在线：仅保留晓晓
+        self.cb_voice.addItem("晓晓 (在线·女声)",
+                              {'engine': 'online', 'id': 'zh-CN-XiaoxiaoNeural'})
+        # 本地：仅保留一个系统中文语音
+        cv = get_local_chinese_voice()
+        if cv:
+            self.cb_voice.addItem(cv[0], {'engine': 'local', 'id': cv[1]})
         else:
-            self.cb_voice.addItem("（未检测到本地语音）")
+            self.cb_voice.addItem("（未检测到系统中文语音）")
             self._disable_item(self.cb_voice.count() - 1)
 
-        self.cb_voice.setCurrentIndex(1)
+        self.cb_voice.setCurrentIndex(0)
 
     def _disable_item(self, idx):
         self.cb_voice.setItemData(idx, None)
@@ -292,13 +288,11 @@ class MainWindow(QMainWindow):
         self.paused = False
         self.btn_play.setEnabled(False)
         self.btn_stop.setEnabled(True)
+        self.btn_pause.setEnabled(True)  # 在线 / 本地模式均支持暂停
+        self.btn_pause.setText("⏸ 暂停")
         if engine == 'local':
-            self.btn_pause.setEnabled(False)
-            self.btn_pause.setText("⏸ 暂停(本地)")
-            self.lbl_status.setText("本地模式：语速/音色下一句生效，停止在当前句后生效")
+            self.lbl_status.setText("本地模式：语速/音色下一句生效，暂停即停当前句")
         else:
-            self.btn_pause.setEnabled(True)
-            self.btn_pause.setText("⏸ 暂停")
             self.lbl_status.setText("就绪")
 
     def on_play_from_start(self):
