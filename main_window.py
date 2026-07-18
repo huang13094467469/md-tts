@@ -1,56 +1,98 @@
 # -*- coding: utf-8 -*-
-"""MD 朗读工具主界面：加载 MD -> 规范渲染预览 -> 点击句子定位朗读 -> 在线/本地双引擎。"""
+"""MD 朗读工具主界面：加载 MD -> 标准 markdown 渲染预览 -> 点击句子定位朗读 -> 在线/本地双引擎。
+
+预览区使用 QWebEngineView（Chromium 内核），标准 markdown 渲染、图片自适应不跳动；
+点击句子通过自定义 mdtts:N 协议回传 Python，当前句高亮由前端 JS 完成。
+"""
 import os
 import sys
 
-from PyQt5.QtCore import Qt, pyqtSignal
+# 必须在 import QtWebEngineWidgets 之前设置，否则 Chromium 子进程在受限/
+# 沙箱环境下启动失败会导致预览区白屏（Windows 上最常见根因）
+os.environ.setdefault('QTWEBENGINE_DISABLE_SANDBOX', '1')
+
+from PyQt5.QtCore import Qt, QUrl, QSize, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTextBrowser, QComboBox, QSlider, QLabel, QFileDialog, QMessageBox,
-    QSplitter, QPlainTextEdit, QFrame, QTextEdit, QPushButton,
+    QComboBox, QSlider, QLabel, QFileDialog, QMessageBox,
+    QSplitter, QPlainTextEdit, QFrame, QPushButton, QInputDialog,
 )
-from PyQt5.QtGui import QFont, QColor, QTextCursor
+from PyQt5.QtGui import QFont
+from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 
 from md_parser import parse_markdown, parse_to_blocks
 from markdown_render import render_markdown
 from tts_engine import TTSPlayer, ONLINE_VOICES, get_local_voices
 
 
-class MarkdownView(QTextBrowser):
-    """规范 markdown 渲染视图，点击句子即定位朗读，支持当前句高亮。"""
+class _Page(QWebEnginePage):
+    """拦截自定义 mdtts:N 协议，把点击的句子 idx 回传给 Python。"""
+    sentenceClicked = pyqtSignal(int)
+    renderError = pyqtSignal(str)
+
+    def acceptNavigationRequest(self, url, _type, isMainFrame):
+        if url.scheme() == 'mdtts':
+            try:
+                self.sentenceClicked.emit(int(url.path()))
+            except Exception:
+                pass
+            return False
+        # 允许本地文件（图片/资源）与常用 http(s) 链接
+        return super().acceptNavigationRequest(url, _type, isMainFrame)
+
+    def renderProcessTerminated(self, terminationType, exitCode, exitReason):
+        # Chromium 渲染子进程崩溃（最常见：被沙箱/杀软拦截白屏）。
+        # 弹窗 + 写日志，避免用户只看到一片空白不知所措。
+        msg = ("预览渲染进程异常退出（类型=%s，退出码=%s）：%s"
+               % (terminationType, exitCode, exitReason))
+        self.renderError.emit(msg)
+
+
+class MarkdownView(QWebEngineView):
+    """标准 markdown 渲染视图：点击句子定位、当前句高亮。"""
     sentenceClicked = pyqtSignal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setOpenLinks(False)
-        self.setReadOnly(True)
-        self.sentence_ranges = {}  # idx -> (start_char, end_char)
+        self._page = _Page(self)
+        self.setPage(self._page)
+        self._page.sentenceClicked.connect(self.sentenceClicked)
+        self._page.renderError.connect(self._on_render_error)
+        self._last_idx = -1
+        self._page.loadFinished.connect(self._on_load)
 
-    def mousePressEvent(self, e):
-        super().mousePressEvent(e)
-        cur = self.cursorForPosition(e.pos())
-        idx = None
-        for n in cur.charFormat().anchorNames():
-            if n.startswith('u'):
-                try:
-                    idx = int(n[1:])
-                    break
-                except ValueError:
-                    pass
-        if idx is None:
-            idx = self._nearest(cur.position())
-        if idx is not None:
-            self.sentenceClicked.emit(idx)
+    def sizeHint(self):
+        # QWebEngineView 默认 sizeHint 为 0x0，放进 QSplitter 会被压成 0 宽，
+        # 导致左侧预览面板"消失"（看起来只有一个编辑面板）。给定合理尺寸修正。
+        return QSize(560, 700)
 
-    def _nearest(self, pos):
-        if not self.sentence_ranges:
-            return None
-        best, bd = None, float('inf')
-        for i, (s, en) in self.sentence_ranges.items():
-            d = abs(((s + en) // 2) - pos)
-            if d < bd:
-                bd, best = d, i
-        return best
+    def _on_render_error(self, msg):
+        try:
+            log = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                               "webengine_error.log")
+            with open(log, "a", encoding="utf-8") as f:
+                f.write(msg + "\n")
+        except Exception:
+            pass
+        QMessageBox.warning(self, "预览渲染失败",
+                            msg + "\n\n详细已记录到 webengine_error.log")
+
+    def _on_load(self, ok):
+        if ok and self._last_idx >= 0:
+            self.page().runJavaScript("highlightSentence(%d)" % self._last_idx)
+
+    def set_content(self, html, base_dir=''):
+        base = QUrl.fromLocalFile(base_dir + os.sep) if base_dir else QUrl()
+        self._last_idx = -1
+        self.setHtml(html, base)
+
+    def highlight(self, idx):
+        self._last_idx = idx
+        self.page().runJavaScript("highlightSentence(%d)" % idx)
+
+    def clear_highlight(self):
+        self._last_idx = -1
+        self.page().runJavaScript("clearHighlight()")
 
 
 class MainWindow(QMainWindow):
@@ -60,6 +102,8 @@ class MainWindow(QMainWindow):
         self.player = TTSPlayer()
         self.current_idx = -1
         self.paused = False
+        self._md_text = ''
+        self._md_dir = ''
         self._init_ui()
         self._init_voices()
 
@@ -92,7 +136,6 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Horizontal)
         self.view = MarkdownView()
         self.view.sentenceClicked.connect(self.on_sentence_clicked)
-        self.view.setFont(QFont("Microsoft YaHei", 11))
         splitter.addWidget(self.view)
 
         self.preview = QPlainTextEdit()
@@ -101,6 +144,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.preview)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        splitter.setSizes([720, 480])  # 显式初始分栏，避免左侧 WebEngine 视图被压成 0 宽
         root.addWidget(splitter, 1)
 
         ctrl = QFrame()
@@ -151,7 +195,6 @@ class MainWindow(QMainWindow):
         cl.addLayout(row2)
 
         root.addWidget(ctrl)
-        self._hl_color = QColor("#FFF3B0")
 
     # ---------------- 音色列表 ----------------
     def _init_voices(self):
@@ -187,7 +230,6 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "提示", "工作区未找到 .md 文件")
             return
         names = [os.path.basename(f) for f in md_files]
-        from PyQt5.QtWidgets import QInputDialog
         name, ok = QInputDialog.getItem(self, "选择 MD 文件", "工作区文件:", names, 0, False)
         if ok:
             self.open_path(md_files[names.index(name)])
@@ -206,8 +248,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "错误", f"无法读取文件：{e}")
             return
         self.units = parse_markdown(text)
-        self.view.setHtml(render_markdown(parse_to_blocks(text)))
-        self._build_ranges()
+        md_dir = os.path.dirname(os.path.abspath(path))
+        self._md_text = text
+        self._md_dir = md_dir
+        self._render_view()
         self.lbl_file.setText(f"📄 {os.path.basename(path)}")
         self.lbl_count.setText(f"共 {len(self.units)} 句")
         self.preview.setPlainText(text)
@@ -215,23 +259,13 @@ class MainWindow(QMainWindow):
         self.player.stop()
         self._reset_buttons()
 
-    def _build_ranges(self):
-        self.view.sentence_ranges = {}
-        doc = self.view.document()
-        block = doc.begin()
-        while block.isValid():
-            it = block.begin()
-            while not it.atEnd():
-                f = it.fragment()
-                for n in f.charFormat().anchorNames():
-                    if n.startswith('u'):
-                        try:
-                            i = int(n[1:])
-                            self.view.sentence_ranges[i] = (f.position(), f.position() + f.length())
-                        except ValueError:
-                            pass
-                it += 1
-            block = block.next()
+    def _render_view(self):
+        if not self._md_text:
+            return
+        self.view.set_content(
+            render_markdown(parse_to_blocks(self._md_text), self._md_dir),
+            self._md_dir,
+        )
 
     # ---------------- 播放控制 ----------------
     def _cur_voice(self):
@@ -286,7 +320,7 @@ class MainWindow(QMainWindow):
     def on_stop(self):
         self.player.stop()
         self._reset_buttons()
-        self._clear_highlight()
+        self.view.clear_highlight()
         self.lbl_status.setText("已停止")
 
     def on_param_changed(self):
@@ -315,25 +349,14 @@ class MainWindow(QMainWindow):
     # ---------------- 信号回调 ----------------
     def _on_current(self, idx):
         self.current_idx = idx
-        self._clear_highlight()
-        rng = self.view.sentence_ranges.get(idx)
-        if rng:
-            s, e = rng
-            cur = QTextCursor(self.view.document())
-            cur.setPosition(s)
-            cur.setPosition(e, QTextCursor.KeepAnchor)
-            extra = QTextEdit.ExtraSelection()
-            extra.cursor = cur
-            extra.format.setBackground(self._hl_color)
-            self.view.setExtraSelections([extra])
-            self.view.setTextCursor(cur)
+        self.view.highlight(idx)
 
     def _on_status(self, text):
         self.lbl_status.setText(text)
 
     def _on_finished(self):
         self._reset_buttons()
-        self._clear_highlight()
+        self.view.clear_highlight()
         self.lbl_status.setText("朗读完成 ✓")
 
     def _on_error(self, msg):
@@ -342,9 +365,6 @@ class MainWindow(QMainWindow):
         self.lbl_status.setText("出错")
 
     # ---------------- 工具 ----------------
-    def _clear_highlight(self):
-        self.view.setExtraSelections([])
-
     def _reset_buttons(self):
         self.btn_play.setEnabled(True)
         self.btn_pause.setEnabled(False)
@@ -358,6 +378,8 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # QtWebEngine 官方建议：创建 QApplication 前设置此属性，避免 OpenGL 上下文问题
+    QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei", 10))
     win = MainWindow()

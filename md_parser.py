@@ -4,17 +4,25 @@
 设计：
   - parse_to_blocks(text): 产出块级结构（标题/段落/列表/引用/代码/表格/分隔线）
   - parse_markdown(text): 从块 flatten 出可朗读句子列表，作为 TTS 的权威序列
-  - 渲染器(markdown_render)也基于同一套块结构与句子切分，保证"句子索引"对齐
+  - markdown_render 也基于同一套块结构与句子切分，保证"句子索引"对齐
+
+句子切分统一在「原始带标记文本」上做，TTS 用 _plain() 去标记得到朗读文本，
+渲染用 _inline_html() 把标记转成样式标签，两者索引严格一致。
 """
 import re
+import os
+import html
 
 # 句末标点（中英文）
 _SENT_SPLIT = re.compile(r'(?<=[。！？!?；;])')
-# 行内 markdown 标记清理
-_IMG = re.compile(r'!\[[^\]]*\]\([^)]*\)')
-_LINK = re.compile(r'\[([^\]]*)\]\([^)]*\)')
-_BOLD_ITALIC = re.compile(r'(\*{1,3}|_{1,3})(.+?)\1')
-_INLINE_CODE = re.compile(r'`([^`]*)`')
+# 行内 markdown 标记
+_IMG = re.compile(r'!\[([^\]]*)\]\(([^)]*)\)')
+_LINK = re.compile(r'\[([^\]]*)\]\(([^)]*)\)')
+_BOLD = re.compile(r'\*\*(.+?)\*\*')
+_BOLD2 = re.compile(r'__(.+?)__')
+_ITAL_S = re.compile(r'(?<!\*)\*(?!\*)(.+?)\*(?!\*)')
+_ITAL_U = re.compile(r'(?<!_)_(?!_)(.+?)_(?!_)')
+_INLINE_CODE = re.compile(r'`([^`]+)`')
 _HTML_TAG = re.compile(r'<[^>]+>')
 _TASK_BOX = re.compile(r'^\s*[-*+]\s+\[[ xX]\]\s*')
 _LIST_MARK = re.compile(r'^\s*([-*+]|\d+[.)])\s+')
@@ -22,22 +30,58 @@ _HEADING = re.compile(r'^\s*(#{1,6})\s*')
 _QUOTE = re.compile(r'^\s*>+\s?')
 _HR = re.compile(r'^\s*([-*_])\s*(\1\s*){2,}$')
 _TABLE_SEP = re.compile(r'^\s*\|?\s*:?-{2,}.*$')
+_FENCE = re.compile(r'^\s*```\s*([\w+-]*)')
 _HAS_WORD = re.compile(r'[\w\u4e00-\u9fff]')
 
 
-def _clean_inline(text: str) -> str:
-    """清理一行里的行内 markdown 语法。"""
+def _resolve(src: str, base_dir: str = '') -> str:
+    """把图片/链接地址解析成可用于 <img src> 的 URL。
+
+    - 远程(http/https/data)、协议相对(//) 原样返回
+    - 绝对路径直接用
+    - 相对路径基于 markdown 文件所在目录解析成 file:/// 绝对路径
+    """
+    if re.match(r'^(https?:|data:|//)', src):
+        return src
+    if os.path.isabs(src):
+        path = src
+    else:
+        path = os.path.join(base_dir, src) if base_dir else src
+    path = os.path.abspath(path)
+    return 'file:///' + path.replace('\\', '/')
+
+
+def _plain(text: str) -> str:
+    """清理一行里的行内 markdown 语法，得到「纯文本」（供朗读）。"""
     text = _IMG.sub('', text)
     text = _LINK.sub(r'\1', text)
-    for _ in range(3):
-        new = _BOLD_ITALIC.sub(r'\2', text)
-        if new == text:
-            break
-        text = new
+    text = _BOLD.sub(r'\1', text)
+    text = _BOLD2.sub(r'\1', text)
+    text = _ITAL_S.sub(r'\1', text)
+    text = _ITAL_U.sub(r'\1', text)
     text = _INLINE_CODE.sub(r'\1', text)
     text = _HTML_TAG.sub('', text)
     text = text.replace('*', '').replace('`', '')
     return text.strip()
+
+
+def _inline_html(text: str, base_dir: str = '') -> str:
+    """把行内 markdown 转成带样式的 HTML（供显示）。
+
+    先整体 HTML 转义，再套用标记 -> 标签，保证不会注入原始标签。
+    """
+    text = html.escape(text)
+    # 图片 -> <img>（显示用，朗读时由 _plain 去除）
+    text = _IMG.sub(lambda m: (
+        f'<img class="md-img" src="{_resolve(m.group(2), base_dir)}" alt="{m.group(1)}"/>'
+    ), text)
+    text = _INLINE_CODE.sub(r'<code>\1</code>', text)
+    text = _LINK.sub(r'<a href="\2">\1</a>', text)
+    text = _BOLD.sub(r'<b>\1</b>', text)
+    text = _BOLD2.sub(r'<b>\1</b>', text)
+    text = _ITAL_S.sub(r'<i>\1</i>', text)
+    text = _ITAL_U.sub(r'<i>\1</i>', text)
+    return text
 
 
 def _split_sentences(text: str, max_len: int = 80):
@@ -68,6 +112,7 @@ def parse_to_blocks(md_text: str):
     blocks = []
     in_code = False
     code_buf = []
+    code_lang = ''
     para_buf = []
     quote_buf = []
 
@@ -83,14 +128,15 @@ def parse_to_blocks(md_text: str):
 
     def flush_code():
         if code_buf:
-            blocks.append({'type': 'code', 'lines': list(code_buf)})
+            blocks.append({'type': 'code', 'lang': code_lang, 'lines': list(code_buf)})
             code_buf.clear()
 
     for raw in lines:
         line = raw.rstrip()
 
-        # 代码块围栏
-        if re.match(r'^\s*```', line):
+        # 代码块围栏（记录语言）
+        fm = _FENCE.match(line)
+        if fm:
             if in_code:
                 flush_code()
                 in_code = False
@@ -99,6 +145,7 @@ def parse_to_blocks(md_text: str):
                 flush_quote()
                 in_code = True
                 code_buf = []
+                code_lang = fm.group(1) or ''
             continue
         if in_code:
             code_buf.append(line)
@@ -123,18 +170,18 @@ def parse_to_blocks(md_text: str):
         if _TABLE_SEP.match(stripped):
             continue
 
-        # 标题
+        # 标题（保留行内标记，供渲染/朗读时各自处理）
         m = _HEADING.match(stripped)
         if m:
             flush_para()
             flush_quote()
             level = len(m.group(1))
-            title = _clean_inline(_HEADING.sub('', stripped))
-            if title:
+            title = _HEADING.sub('', stripped)
+            if title.strip():
                 blocks.append({'type': 'heading', 'level': level, 'text': title})
             continue
 
-        # 引用（连续 > 行合并为一个引用块）
+        # 引用
         if _QUOTE.match(stripped):
             flush_para()
             quote_buf.append(_QUOTE.sub('', stripped))
@@ -145,7 +192,7 @@ def parse_to_blocks(md_text: str):
             flush_para()
             flush_quote()
             cells = [c.strip() for c in stripped.strip('|').split('|')]
-            cells = [_clean_inline(c) for c in cells if c.strip()]
+            cells = [c for c in cells if c.strip()]
             if blocks and blocks[-1]['type'] == 'table':
                 blocks[-1]['rows'].append(cells)
             else:
@@ -156,7 +203,7 @@ def parse_to_blocks(md_text: str):
         if _TASK_BOX.match(stripped):
             flush_para()
             flush_quote()
-            item = _clean_inline(_TASK_BOX.sub('', stripped))
+            item = _TASK_BOX.sub('', stripped)
             blocks.append({'type': 'list', 'ordered': False, 'text': item})
             continue
         if _LIST_MARK.match(stripped):
@@ -164,11 +211,11 @@ def parse_to_blocks(md_text: str):
             flush_quote()
             m2 = _LIST_MARK.match(stripped)
             ordered = bool(re.match(r'\d', m2.group(1)))
-            item = _clean_inline(_LIST_MARK.sub('', stripped))
+            item = _LIST_MARK.sub('', stripped)
             blocks.append({'type': 'list', 'ordered': ordered, 'text': item})
             continue
 
-        # 普通段落文字（累积，遇空行再切）
+        # 普通段落文字
         para_buf.append(stripped)
 
     flush_para()
@@ -178,16 +225,16 @@ def parse_to_blocks(md_text: str):
 
 
 def _block_sentences(block):
-    """返回该块可朗读的句子列表（未过滤，顺序即朗读顺序）。"""
+    """返回该块「原始带标记」的可朗读句子列表（顺序即朗读顺序）。"""
     t = block['type']
     if t == 'heading':
-        return [block['text']] if block.get('text') else []
+        return [block['text']] if block.get('text', '').strip() else []
     if t == 'paragraph':
         joined = ' '.join(block['lines'])
-        return _split_sentences(_clean_inline(joined))
+        return _split_sentences(_IMG.sub('', joined))
     if t == 'quote':
         joined = ' '.join(block['lines'])
-        return _split_sentences(_clean_inline(joined))
+        return _split_sentences(_IMG.sub('', joined))
     if t == 'list':
         return _split_sentences(block['text'])
     if t == 'table':
@@ -203,14 +250,15 @@ def _block_sentences(block):
 def parse_markdown(md_text: str):
     """把 markdown 解析为可朗读单元列表（TTS 权威序列）。
 
-    返回: list[dict]，每项 {'text': 朗读文本, 'kind': 类型}
+    返回: list[dict]，每项 {'text': 朗读纯文本, 'kind': 类型}
     """
     blocks = parse_to_blocks(md_text)
     units = []
     for b in blocks:
         for s in _block_sentences(b):
-            if s and _HAS_WORD.search(s):
-                units.append({'text': s, 'kind': b['type']})
+            p = _plain(s)
+            if p and _HAS_WORD.search(p):
+                units.append({'text': p, 'kind': b['type']})
     return units
 
 
