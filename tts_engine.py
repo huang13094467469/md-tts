@@ -11,6 +11,8 @@
 """
 import asyncio
 import io
+import threading
+import time
 
 import edge_tts
 from PyQt5.QtCore import QThread, pyqtSignal
@@ -71,7 +73,16 @@ class BaseWorker(QThread):
 
 
 class OnlineWorker(BaseWorker):
-    """edge-tts 在线合成 + pygame 播放，支持暂停/继续/实时换音色语速。"""
+    """edge-tts 在线合成 + pygame 播放。
+
+    关键能力：**预合成（预取）**。后台线程始终提前合成当前句之后约 LOOKAHEAD
+    句的音频并缓存，主播放循环优先从缓存取，从而把 edge-tts 的网络延迟隐藏在
+    播放过程中，句间几乎无停顿、连贯性大幅提升。同时支持暂停/继续、实时换音色语速。
+    """
+
+    LOOKAHEAD = 10  # 预合成窗口：保持当前句前方约 10 句已就绪
+    PREFETCH_WAIT = 4.0  # 主循环等预合成的最长秒数，超时即降级同步合成
+    SYNTH_TIMEOUT = 25.0  # 单句 edge-tts 合成的超时秒数，防止网络挂起卡死线程
 
     def __init__(self, units, voice, rate_pct, start_index=0):
         super().__init__(units, start_index)
@@ -79,6 +90,14 @@ class OnlineWorker(BaseWorker):
         self.rate_pct = rate_pct
         self._cmd = None
         self._loop = None
+        # 预合成缓冲（受 self._cond 保护）
+        self._cond = threading.Condition()
+        self._prepared = {}            # idx -> (voice, rate_pct, audio_bytes)
+        self._prep_errors = {}         # idx -> errmsg
+        self._prep_idx = start_index  # 预合成游标（下一个要合成的句下标）
+        self._play_idx = start_index - 1
+        self._prep_finished = False
+        self._prep_thread = None
 
     def pause(self):
         self._cmd = ('pause',)
@@ -87,25 +106,115 @@ class OnlineWorker(BaseWorker):
         self._cmd = ('resume',)
 
     def set_params(self, voice=None, rate_pct=None):
+        # 直接更新；预合成线程读最新值，旧缓存因参数不符在播放时被即时重合成
         if voice is not None:
             self.voice = voice
         if rate_pct is not None:
             self.rate_pct = rate_pct
-        self._cmd = ('params',)
+        with self._cond:
+            self._cond.notify_all()
 
-    def _gen_audio(self, text):
-        rate = f"{self.rate_pct:+d}%" if self.rate_pct else "+0%"
-        comm = edge_tts.Communicate(text, self.voice, rate=rate)
+    def _gen_audio(self, loop, text, voice=None, rate_pct=None):
+        voice = self.voice if voice is None else voice
+        rate_pct = self.rate_pct if rate_pct is None else rate_pct
+        rate = f"{rate_pct:+d}%" if rate_pct else "+0%"
+        comm = edge_tts.Communicate(text, voice, rate=rate)
         buf = io.BytesIO()
 
         async def _run():
-            async for chunk in comm.stream():
-                if chunk["type"] == "audio":
-                    buf.write(chunk["data"])
+            agen = comm.stream()
+            try:
+                while True:
+                    # 逐块加超时，避免连接/传输挂起导致整个预合成线程永久卡死
+                    chunk = await asyncio.wait_for(agen.__anext__(),
+                                                   timeout=self.SYNTH_TIMEOUT)
+                    if chunk["type"] == "audio":
+                        buf.write(chunk["data"])
+            except StopAsyncIteration:
+                pass
 
-        self._loop.run_until_complete(_run())
+        loop.run_until_complete(_run())
         buf.seek(0)
         return buf.read()
+
+    # ---------------- 预合成后台线程 ----------------
+    def _prep_loop(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            while not self._stop:
+                with self._cond:
+                    if self._prep_idx >= len(self.units):
+                        self._prep_finished = True
+                        self._cond.notify_all()
+                        break
+                    # 领先播放位置过多时，让出 CPU 等主循环推进
+                    if self._prep_idx > self._play_idx + self.LOOKAHEAD:
+                        ready = False
+                    else:
+                        i = self._prep_idx
+                        self._prep_idx += 1
+                        ready = True
+                if not ready:
+                    time.sleep(0.05)
+                    continue
+                # 单句合成失败（含超时）：记录错误后继续下一句，
+                # 不允许单句卡死/崩溃整条预合成线程
+                try:
+                    audio = self._gen_audio(loop, self.units[i]['text'])
+                except Exception as e:
+                    with self._cond:
+                        self._prep_errors[i] = str(e)
+                        self._cond.notify_all()
+                    continue
+                with self._cond:
+                    self._prepared[i] = (self.voice, self.rate_pct, audio)
+                    self._cond.notify_all()
+        finally:
+            with self._cond:
+                self._prep_finished = True
+                self._cond.notify_all()
+
+    def _take_audio(self, idx, text):
+        """取第 idx 句音频。
+
+        策略：优先用参数匹配的预合成缓存（零等待）；未命中则限时等待预合成线程
+        PREFETCH_WAIT 秒；超时或预合成失败则用主线程同步兜底合成。这样即使预
+        合成线程因网络卡在某句，主循环最多停顿 PREFETCH_WAIT 秒也会自行续上，
+        绝不永久卡死（修复「前 10 句顺畅、后续读不动」的问题）。
+        """
+        # 1. 立即可用缓存
+        with self._cond:
+            item = self._prepared.get(idx)
+            if item and item[0] == self.voice and item[1] == self.rate_pct:
+                del self._prepared[idx]
+                return item[2]
+            if item:
+                # 参数不符（用户中途切换音色/语速），丢弃旧缓存，等重写
+                del self._prepared[idx]
+
+        # 2. 限时等待预合成线程
+        deadline = time.time() + self.PREFETCH_WAIT
+        while time.time() < deadline:
+            with self._cond:
+                item = self._prepared.get(idx)
+                if item and item[0] == self.voice and item[1] == self.rate_pct:
+                    del self._prepared[idx]
+                    return item[2]
+                if idx in self._prep_errors:
+                    # 预合成已尝试该句但失败 -> 跳出，走主线程兜底合成
+                    self._prep_errors.pop(idx)
+                    break
+                if self._prep_finished and self._prep_idx > idx:
+                    # 预合成已越过该句却仍无缓存（异常）-> 兜底
+                    break
+            time.sleep(0.05)
+
+        # 3. 兜底：主线程自己合成（同样带超时保护）
+        try:
+            return self._gen_audio(self._loop, text)
+        except Exception as e:
+            raise Exception(f"第{idx+1}句生成失败：{e}")
 
     def _handle_cmd(self):
         cmd = self._cmd
@@ -137,8 +246,6 @@ class OnlineWorker(BaseWorker):
             import pygame
             pygame.mixer.music.unpause()
             self.sig_status.emit("播放中")
-        elif kind == 'params':
-            pass
         return None
 
     def run(self):
@@ -157,28 +264,46 @@ class OnlineWorker(BaseWorker):
         self._loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self._loop)
 
+        # 启动预合成后台线程（daemon，主线程退出即终止）
+        self._prep_thread = threading.Thread(target=self._prep_loop, daemon=True)
+        self._prep_thread.start()
+
         idx = self.start_index
         total = len(self.units)
         self.sig_status.emit("播放中")
         while idx < total:
             if self._stop:
                 pygame.mixer.music.stop()
+                self._stop = True
+                with self._cond:
+                    self._cond.notify_all()
                 return
             r = self._handle_cmd()
             if r == 'stop':
                 pygame.mixer.music.stop()
+                self._stop = True
+                with self._cond:
+                    self._cond.notify_all()
                 return
+            with self._cond:
+                self._play_idx = idx
             self.sig_current.emit(idx)
             self.sig_status.emit(f"播放中 {idx+1}/{total}")
             text = self.units[idx]['text']
             try:
-                audio = self._gen_audio(text)
+                audio = self._take_audio(idx, text)
             except Exception as e:
                 self.sig_error.emit(f"第{idx+1}句生成失败：{e}")
+                self._stop = True
+                with self._cond:
+                    self._cond.notify_all()
                 return
             r = self._handle_cmd()
             if r == 'stop':
                 pygame.mixer.music.stop()
+                self._stop = True
+                with self._cond:
+                    self._cond.notify_all()
                 return
             try:
                 pygame.mixer.music.load(io.BytesIO(audio))
@@ -187,15 +312,29 @@ class OnlineWorker(BaseWorker):
                     r = self._handle_cmd()
                     if r == 'stop':
                         pygame.mixer.music.stop()
+                        self._stop = True
+                        with self._cond:
+                            self._cond.notify_all()
                         return
                     self.msleep(50)
             except Exception as e:
                 self.sig_error.emit(f"播放失败：{e}")
+                self._stop = True
+                with self._cond:
+                    self._cond.notify_all()
                 return
             idx += 1
 
         self.sig_status.emit("朗读完成")
         self.sig_finished.emit()
+        # 收尾：通知预合成线程退出并等待
+        self._stop = True
+        with self._cond:
+            self._cond.notify_all()
+        try:
+            self._prep_thread.join(timeout=3)
+        except Exception:
+            pass
 
 
 class LocalWorker(BaseWorker):
