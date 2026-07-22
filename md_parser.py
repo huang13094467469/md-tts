@@ -30,8 +30,19 @@ _HEADING = re.compile(r'^\s*(#{1,6})\s*')
 _QUOTE = re.compile(r'^\s*>+\s?')
 _HR = re.compile(r'^\s*([-*_])\s*(\1\s*){2,}$')
 _TABLE_SEP = re.compile(r'^\s*\|?\s*:?-{2,}.*$')
-_FENCE = re.compile(r'^\s*```\s*([\w+-]*)')
+# 围栏开栏：3 个及以上反引号，捕获反引号串与语言标注（支持 CommonMark 嵌套围栏）
+_FENCE_OPEN = re.compile(r'^\s*(`{3,})\s*([\w+-]*)')
 _HAS_WORD = re.compile(r'[\w\u4e00-\u9fff]')
+
+
+def _is_fence_close(line: str, fence: str) -> bool:
+    """判断该行是否为匹配的闭栏：整行去除空白后全由反引号组成，且数量 >= 开栏。
+
+    CommonMark 规定闭栏反引号数量需 >= 开栏，此处据此实现，使得
+    ````md ... ``` ... ```` 中内层的 3 反引号不会被误判为外层 4 反引号块的结束。
+    """
+    s = line.strip()
+    return bool(s) and set(s) == {'`'} and len(s) >= len(fence)
 
 
 def _resolve(src: str, base_dir: str = '') -> str:
@@ -113,6 +124,7 @@ def parse_to_blocks(md_text: str):
     in_code = False
     code_buf = []
     code_lang = ''
+    code_fence = ''
     para_buf = []
     quote_buf = []
 
@@ -134,21 +146,26 @@ def parse_to_blocks(md_text: str):
     for raw in lines:
         line = raw.rstrip()
 
-        # 代码块围栏（记录语言）
-        fm = _FENCE.match(line)
-        if fm:
-            if in_code:
+        if in_code:
+            # 代码块内：仅匹配的闭栏（同数量或更多反引号）才结束本块；
+            # 内层更少数量的反引号行（如 ```` 块里的 ```）视作代码内容保留
+            if _is_fence_close(line, code_fence):
                 flush_code()
                 in_code = False
-            else:
-                flush_para()
-                flush_quote()
-                in_code = True
-                code_buf = []
-                code_lang = fm.group(1) or ''
-            continue
-        if in_code:
+                code_fence = ''
+                continue
             code_buf.append(line)
+            continue
+
+        # 代码块开栏（3 个及以上反引号，记录语言与开栏反引号串）
+        fm = _FENCE_OPEN.match(line)
+        if fm:
+            flush_para()
+            flush_quote()
+            in_code = True
+            code_buf = []
+            code_fence = fm.group(1)
+            code_lang = fm.group(2) or ''
             continue
 
         stripped = line.strip()
@@ -260,6 +277,93 @@ def parse_markdown(md_text: str):
             if p and _HAS_WORD.search(p):
                 units.append({'text': p, 'kind': b['type']})
     return units
+
+
+# ----------------- MDX 预处理 -----------------
+_MDX_FRONTMATTER = re.compile(r'^\ufeff?---\n.*?\n---\s*\n', re.DOTALL)
+_MDX_IMPORT_EXPORT = re.compile(r'^\s*(import|export)\b[^\n]*$', re.MULTILINE)
+_MDX_PAIR_TAG = re.compile(
+    r'<[A-Z][A-Za-z0-9.]*\b[^>]*>(.*?)</[A-Z][A-Za-z0-9.]*>', re.DOTALL)
+_MDX_SELF_TAG = re.compile(r'<[A-Z][A-Za-z0-9.]*\b[^>]*/>')
+_MDX_CURLY = re.compile(r'\{.*?\}', re.DOTALL)
+
+# 围栏代码块 / 行内代码：在 MDX 清洗前抽离、清洗后还原，避免代码内容被误删
+# 围栏块用行扫描抽离（见 _mdx_stash_fences），以正确处理 3+ 反引号嵌套；
+# 行内代码用正则即可
+_MDX_INLINE_CODE = re.compile(r'`[^`\n]+`')
+_MDX_SLOT = re.compile(r'\x00(\d+)\x00')
+
+
+def _mdx_stash_fences(text: str, slots: list) -> str:
+    """行扫描抽离所有围栏代码块（支持 3+ 反引号嵌套），替换为占位符。
+
+    与 _FENCE_OPEN / _is_fence_close 配对，确保 ````md ... ``` ... ````
+    中内层 3 反引号不会被误当作外层 4 反引号块的结束，从而完整保护代码内容。
+    抽离内容含开/闭栏行，还原后 parse_to_blocks 可正常识别。
+    """
+    lines = text.replace('\r\n', '\n').replace('\r', '\n').split('\n')
+    out = []
+    i = 0
+    n = len(lines)
+    while i < n:
+        m = _FENCE_OPEN.match(lines[i])
+        if m:
+            fence = m.group(1)
+            buf = [lines[i]]
+            i += 1
+            while i < n:
+                buf.append(lines[i])
+                if _is_fence_close(lines[i], fence):
+                    i += 1
+                    break
+                i += 1
+            slots.append('\n'.join(buf))
+            out.append('\x00%d\x00' % (len(slots) - 1))
+        else:
+            out.append(lines[i])
+            i += 1
+    return '\n'.join(out)
+
+
+def preprocess_mdx(text: str) -> str:
+    """把 MDX 当作可朗读的 Markdown 处理。
+
+    MDX = Markdown + JSX。朗读/预览场景下需剥离「非朗读内容」：
+      - 顶部 frontmatter（--- ... --- 元信息）
+      - 顶层 import/export 语句
+      - JSX 组件标签（成对 -> 保留内部文字，自闭合 -> 删除）
+      - JSX 表达式 {...}
+    保留纯文本，使现有 markdown 流水线（分句/渲染）可直接复用。
+
+    注意：上述清洗只应作用于正文中的 JSX 语法，围栏代码块与行内代码
+    的内容必须原样保留（代码里出现 {}、import、<Tag> 等都是合法的），
+    因此先做占位抽离，清洗后再还原。
+    """
+    slots = []
+
+    def _stash(m):
+        slots.append(m.group(0))
+        return '\x00%d\x00' % (len(slots) - 1)
+
+    text = _mdx_stash_fences(text, slots)
+    text = _MDX_INLINE_CODE.sub(_stash, text)
+
+    text = _MDX_FRONTMATTER.sub('', text)
+    text = _MDX_IMPORT_EXPORT.sub('', text)
+    # 成对组件标签 -> 保留内部，循环处理嵌套
+    prev = None
+    while prev != text:
+        prev = text
+        text = _MDX_PAIR_TAG.sub(r'\1', text)
+    # 自闭合组件标签 -> 删除
+    text = _MDX_SELF_TAG.sub('', text)
+    # 剩余 JSX 表达式 -> 删除
+    text = _MDX_CURLY.sub('', text)
+    # 压缩多余空行
+    text = re.sub(r'\n{3,}', '\n\n', text)
+
+    text = _MDX_SLOT.sub(lambda m: slots[int(m.group(1))], text)
+    return text.strip() + '\n'
 
 
 if __name__ == '__main__':

@@ -20,7 +20,7 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtGui import QFont
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
 
-from md_parser import parse_markdown, parse_to_blocks
+from md_parser import parse_markdown, parse_to_blocks, preprocess_mdx
 from markdown_render import render_markdown
 from tts_engine import TTSPlayer, get_local_chinese_voice
 
@@ -114,7 +114,7 @@ class MainWindow(QMainWindow):
 
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件")
-        open_act = file_menu.addAction("打开 MD 文件")
+        open_act = file_menu.addAction("打开 MD/MDX 文件")
         open_act.triggered.connect(self.open_file)
         dir_menu = menubar.addMenu("示例")
         dir_menu.addAction("加载工作区 MD 列表").triggered.connect(self.load_workspace_md)
@@ -221,9 +221,9 @@ class MainWindow(QMainWindow):
         parent = os.path.dirname(os.path.abspath(__file__))
         parent = os.path.dirname(parent)
         md_files = [os.path.join(parent, n) for n in os.listdir(parent)
-                    if n.lower().endswith('.md') and os.path.isfile(os.path.join(parent, n))]
+                    if n.lower().endswith(('.md', '.mdx')) and os.path.isfile(os.path.join(parent, n))]
         if not md_files:
-            QMessageBox.information(self, "提示", "工作区未找到 .md 文件")
+            QMessageBox.information(self, "提示", "工作区未找到 .md / .mdx 文件")
             return
         names = [os.path.basename(f) for f in md_files]
         name, ok = QInputDialog.getItem(self, "选择 MD 文件", "工作区文件:", names, 0, False)
@@ -232,7 +232,8 @@ class MainWindow(QMainWindow):
 
     def open_file(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "打开 Markdown 文件", "", "Markdown (*.md);;All (*.*)")
+            self, "打开 Markdown 文件", "",
+            "Markdown / MDX (*.md *.mdx);;Markdown (*.md);;MDX (*.mdx);;All (*.*)")
         if path:
             self.open_path(path)
 
@@ -243,6 +244,11 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "错误", f"无法读取文件：{e}")
             return
+        # .mdx 需剥离 JSX / import-export / 表达式后再走 markdown 流水线，
+        # 避免朗读出一堆标签名；.md 直接处理
+        ext = os.path.splitext(path)[1].lower()
+        if ext == '.mdx':
+            text = preprocess_mdx(text)
         self.units = parse_markdown(text)
         md_dir = os.path.dirname(os.path.abspath(path))
         self._md_text = text
