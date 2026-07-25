@@ -2,15 +2,17 @@
 """TTS 播放引擎。
 支持两种模式：
   - online : edge-tts 在线合成（音质高、需联网、有延迟）
-  - local  : 本机 Windows SAPI 语音（离线、零延迟、最连贯）
+  - local  : 本机系统语音（离线、零延迟、最连贯）
 
-本地模式直接用 comtypes 调用 Windows SAPI.SpVoice，绕开 pyttsx3 在
-循环里多次 runAndWait 只朗读首句的已知问题，句间连续、可控、可中途停止。
+本地引擎按平台分流：
+  - Windows : comtypes 调用 SAPI.SpVoice（绕开 pyttsx3 多句只读首句的问题）
+  - macOS   : PyObjC 调用 AVSpeechSynthesizer（原生语音框架，支持暂停/停止/切音色）
 
 两种 Worker 暴露相同的信号与停止接口，由 TTSPlayer 统一调度。
 """
 import asyncio
 import io
+import sys
 import threading
 import time
 
@@ -18,14 +20,53 @@ import edge_tts
 from PyQt5.QtCore import QThread, pyqtSignal
 
 
-# 在线音色（edge-tts）—— 仅保留晓晓一个
+# 在线音色（edge-tts）-- 仅保留晓晓一个
 ONLINE_VOICES = [
     ("晓晓 (在线·女声)", "zh-CN-XiaoxiaoNeural"),
 ]
 
 
+IS_MAC = sys.platform == 'darwin'
+IS_WIN = sys.platform == 'win32'
+
+
+# =========================================================================
+# macOS AVSpeechSynthesizer delegate（模块级 class，PyObjC 元类才能正确注册选择器）
+# =========================================================================
+if IS_MAC:
+    from Foundation import NSObject
+    import objc
+
+    class _MacSpeechDelegate(NSObject):
+        """AVSpeechSynthesizerDelegate：记录「当前 utterance 是否结束」。"""
+
+        @objc.signature(b'v@:@@')
+        def speechSynthesizer_didFinishSpeechUtterance_(self, synth, utt):
+            self.done = True
+
+        @objc.signature(b'v@:@@')
+        def speechSynthesizer_didCancelSpeechUtterance_(self, synth, utt):
+            self.cancelled = True
+            self.done = True
+
+
+# =========================================================================
+# 本地语音枚举（平台感知）
+# =========================================================================
 def get_local_voices():
-    """返回本机 SAPI 语音列表 [(显示名, voice_id), ...]，无则空。"""
+    """返回本机系统语音列表 [(显示名, voice_id), ...]，无则空。
+
+    - Windows : SAPI.SpVoice
+    - macOS   : AVSpeechSynthesisVoice.speechVoices()
+    """
+    if IS_WIN:
+        return _get_sapi_voices()
+    if IS_MAC:
+        return _get_avs_voices()
+    return []
+
+
+def _get_sapi_voices():
     try:
         import comtypes.client
         v = comtypes.client.CreateObject("SAPI.SpVoice")
@@ -39,11 +80,27 @@ def get_local_voices():
         return []
 
 
-def get_local_chinese_voice():
-    """返回本机「中文」SAPI 语音 (name, id)，无则取第一个本地语音，都没有则 None。
+def _get_avs_voices():
+    """枚举 macOS AVSpeechSynthesisVoice，返回 [(显示名, identifier)]。
 
-    用于把本地选项收敛为唯一一个中文系统语音，避免下拉列出一堆无关语音。
+    identifier 形如 com.apple.voice.compact.zh-CN.Tingting，后续作为 voice_id 传给
+    AVSpeechSynthesisVoice.voiceWithIdentifier_ 来精确选中。
     """
+    try:
+        import AVFoundation as av
+        out = []
+        for v in av.AVSpeechSynthesisVoice.speechVoices():
+            name = str(v.name())
+            lang = str(v.language())
+            ident = str(v.identifier())
+            out.append((f"{name} ({lang})", ident))
+        return out
+    except Exception:
+        return []
+
+
+def get_local_chinese_voice():
+    """返回本机「中文」系统语音 (name, id)，无则取第一个本地语音，都没有则 None。"""
     voices = get_local_voices()
     if not voices:
         return None
@@ -56,6 +113,9 @@ def get_local_chinese_voice():
     return voices[0]
 
 
+# =========================================================================
+# 基类
+# =========================================================================
 class BaseWorker(QThread):
     sig_current = pyqtSignal(int)
     sig_status = pyqtSignal(str)
@@ -72,6 +132,9 @@ class BaseWorker(QThread):
         self._stop = True
 
 
+# =========================================================================
+# 在线引擎：edge-tts + pygame（跨平台）
+# =========================================================================
 class OnlineWorker(BaseWorker):
     """edge-tts 在线合成 + pygame 播放。
 
@@ -337,6 +400,9 @@ class OnlineWorker(BaseWorker):
             pass
 
 
+# =========================================================================
+# Windows 本地引擎：SAPI.SpVoice（保持原有实现）
+# =========================================================================
 class LocalWorker(BaseWorker):
     """本机 SAPI 语音（离线、零延迟、句间连续）。
 
@@ -482,6 +548,212 @@ class LocalWorker(BaseWorker):
         self.sig_finished.emit()
 
 
+# =========================================================================
+# macOS 本地引擎：AVSpeechSynthesizer（PyObjC）
+# =========================================================================
+class MacWorker(BaseWorker):
+    """macOS 本机语音（AVSpeechSynthesizer）。
+
+    设计要点：
+      - Worker 跑在 QThread 子线程，但 AVSpeechSynthesizer 的合成与回调依赖
+        线程的 NSRunLoop。因此 run() 中先创建 synthesizer+delegate，再在
+        每句的等待循环里驱动 NSRunLoop，让 delegate 回调得以触发。
+      - 暂停用 pauseSpeakingAtBoundary_（立刻断点暂停），恢复用 continueSpeaking。
+      - 停止用 stopSpeakingAtBoundary_，会触发 didCancel。
+      - 语速/音色在每句开始前应用（下一句生效，与 SAPI 版一致）。
+      - rate_wpm 映射到 AVSpeechUtterance.rate（范围 AVSpeechUtteranceMinimumSpeechRate
+        .. MaximumSpeechRate，默认 DefaultSpeechRate≈0.5）。
+    """
+
+    def __init__(self, units, voice_id, rate_wpm, start_index=0):
+        super().__init__(units, start_index)
+        self.voice_id = voice_id
+        self.rate_wpm = rate_wpm
+        self._paused = False
+        self._synth = None
+        self._delegate = None
+
+    def set_params(self, voice=None, rate_wpm=None):
+        if voice is not None:
+            self.voice_id = voice
+        if rate_wpm is not None:
+            self.rate_wpm = rate_wpm
+
+    def pause(self):
+        self._paused = True
+
+    def resume(self):
+        self._paused = False
+
+    @staticmethod
+    def _wpm_to_avs_rate(wpm):
+        """把「字/分钟」映射到 AVSpeechUtterance.rate。
+
+        AVSpeechUtteranceDefaultSpeechRate ≈ 0.5，范围 [min, max]。
+        经验映射：180 wpm -> default；80 -> ~0.22；320 -> ~0.89。线性即可。
+        """
+        import AVFoundation as av
+        # PyObjC 中这些是常量属性（float），不是函数
+        lo = float(av.AVSpeechUtteranceMinimumSpeechRate)
+        hi = float(av.AVSpeechUtteranceMaximumSpeechRate)
+        df = float(av.AVSpeechUtteranceDefaultSpeechRate)
+        # 180 wpm -> default；按比例外推到 [80, 320]
+        wpm = max(80, min(320, wpm))
+        if wpm >= 180:
+            # 180..320 -> default..max
+            t = (wpm - 180) / (320 - 180)
+            r = df + t * (hi - df)
+        else:
+            # 80..180 -> min..default
+            t = (wpm - 80) / (180 - 80)
+            r = lo + t * (df - lo)
+        return max(lo, min(hi, r))
+
+    def _make_synth(self):
+        import AVFoundation as av
+
+        synth = av.AVSpeechSynthesizer.alloc().init()
+        # 用模块级 _MacSpeechDelegate（PyObjC 已注册选择器），实例属性 done/cancelled
+        # 在创建后赋值即可，无需重写 init。
+        delegate = _MacSpeechDelegate.alloc().init()
+        delegate.done = False
+        delegate.cancelled = False
+        synth.setDelegate_(delegate)
+        return synth, delegate
+
+    def _select_voice(self):
+        if not self.voice_id:
+            return None
+        try:
+            import AVFoundation as av
+            v = av.AVSpeechSynthesisVoice.voiceWithIdentifier_(self.voice_id)
+            if v:
+                return v
+            # 兜底：按 language 匹配
+            for vv in av.AVSpeechSynthesisVoice.speechVoices():
+                if str(vv.identifier()) == self.voice_id:
+                    return vv
+        except Exception:
+            pass
+        return None
+
+    def _speak_one(self, text):
+        """合成并朗读一句，阻塞直到完成或被取消。返回 'ok' / 'stop'。"""
+        import AVFoundation as av
+        from Foundation import NSRunLoop, NSDate
+
+        utt = av.AVSpeechUtterance.speechUtteranceWithString_(text)
+        utt.setRate_(self._wpm_to_avs_rate(self.rate_wpm))
+        v = self._select_voice()
+        if v:
+            utt.setVoice_(v)
+        # 重置 delegate 标志
+        self._delegate.done = False
+        self._delegate.cancelled = False
+        self._synth.speakUtterance_(utt)
+
+        # 驱动当前线程的 NSRunLoop，让 delegate 回调得以触发；
+        # 同时轮询暂停/停止标志。isSpeaking() 兜底：若 delegate 回调因故未触发
+        # 但 synthesizer 已停止，也视为本句结束，避免死锁。
+        paused_applied = False
+        # 粗略总超时：按字数估算，最长 60s，防止极端卡死
+        deadline = time.time() + min(60.0, 2.0 + len(text) * 0.6)
+        while not self._delegate.done:
+            if self._stop:
+                try:
+                    self._synth.stopSpeakingAtBoundary_(av.AVSpeechBoundaryImmediate)
+                except Exception:
+                    pass
+                return 'stop'
+            if self._paused and not paused_applied:
+                try:
+                    self._synth.pauseSpeakingAtBoundary_(av.AVSpeechBoundaryImmediate)
+                except Exception:
+                    pass
+                paused_applied = True
+                self.sig_status.emit("已暂停（本地）")
+            elif not self._paused and paused_applied:
+                try:
+                    self._synth.continueSpeaking()
+                except Exception:
+                    pass
+                paused_applied = False
+                self.sig_status.emit("播放中（本地）")
+            # isSpeaking 兜底：未在播放且 delegate 未触发 -> 视为结束
+            try:
+                if not self._synth.isSpeaking():
+                    # 给 delegate 一点点时间补触发，避免误判句间空隙
+                    NSRunLoop.currentRunLoop().runUntilDate_(
+                        NSDate.dateWithTimeIntervalSinceNow_(0.05))
+                    if not self._synth.isSpeaking() and not self._delegate.done:
+                        break
+            except Exception:
+                pass
+            if time.time() > deadline:
+                break
+            # 让 runloop 跑一小段，处理 delegate 回调
+            NSRunLoop.currentRunLoop().runUntilDate_(
+                NSDate.dateWithTimeIntervalSinceNow_(0.03))
+        return 'ok'
+
+    def run(self):
+        try:
+            import AVFoundation as av  # noqa: F401
+        except Exception as e:
+            self.sig_error.emit(f"macOS 语音组件加载失败（需 pyobjc-framework-AVFoundation）：{e}")
+            return
+
+        try:
+            self._synth, self._delegate = self._make_synth()
+        except Exception as e:
+            self.sig_error.emit(f"本地语音初始化失败：{e}")
+            return
+
+        idx = self.start_index
+        total = len(self.units)
+        self.sig_status.emit("播放中（本地）")
+        while idx < total:
+            if self._stop:
+                break
+
+            # 暂停态下等待恢复（用于句间暂停：当前句已读完，停在下一句前）
+            while self._paused and not self._stop:
+                self.msleep(80)
+            if self._stop:
+                break
+
+            text = self.units[idx]['text']
+            if not text.strip():
+                idx += 1
+                continue
+
+            self.sig_current.emit(idx)
+            self.sig_status.emit(f"播放中（本地）{idx+1}/{total}")
+
+            r = self._speak_one(text)
+            if r == 'stop':
+                self.sig_status.emit("已停止")
+                break
+
+            if self._stop:
+                self.sig_status.emit("已停止")
+                break
+            idx += 1
+
+        # 收尾：确保停止合成
+        try:
+            if self._synth:
+                self._synth.stopSpeakingAtBoundary_(av.AVSpeechBoundaryImmediate)
+        except Exception:
+            pass
+        if not self._stop:
+            self.sig_status.emit("朗读完成")
+        self.sig_finished.emit()
+
+
+# =========================================================================
+# 播放控制器（GUI 友好）
+# =========================================================================
 class TTSPlayer:
     """对 GUI 友好的播放控制器包装。"""
 
@@ -494,6 +766,8 @@ class TTSPlayer:
         self.stop()
         if engine_type == 'online':
             w = OnlineWorker(units, voice, rate, start_index)
+        elif IS_MAC:
+            w = MacWorker(units, voice, rate, start_index)
         else:
             w = LocalWorker(units, voice, rate, start_index)
         if on_current:  w.sig_current.connect(on_current)

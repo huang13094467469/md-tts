@@ -8,14 +8,18 @@ import os
 import sys
 
 # 必须在 import QtWebEngineWidgets 之前设置，否则 Chromium 子进程在受限/
-# 沙箱环境下启动失败会导致预览区白屏（Windows 上最常见根因）
+# 沙箱环境下启动失败会导致预览区白屏（Windows 上最常见根因；Mac 上一般无害）
 os.environ.setdefault('QTWEBENGINE_DISABLE_SANDBOX', '1')
+
+# 平台感知字体：Mac 用系统原生字体，Windows 保持原配置
+IS_MAC = sys.platform == 'darwin'
+_UI_FONT = 'PingFang SC' if IS_MAC else 'Microsoft YaHei'
 
 from PyQt5.QtCore import Qt, QUrl, QSize, pyqtSignal
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QSlider, QLabel, QFileDialog, QMessageBox,
-    QSplitter, QPlainTextEdit, QFrame, QPushButton, QInputDialog,
+    QFrame, QPushButton, QInputDialog,
 )
 from PyQt5.QtGui import QFont
 from PyQt5.QtWebEngineWidgets import QWebEngineView, QWebEnginePage
@@ -62,8 +66,8 @@ class MarkdownView(QWebEngineView):
         self._page.loadFinished.connect(self._on_load)
 
     def sizeHint(self):
-        # QWebEngineView 默认 sizeHint 为 0x0，放进 QSplitter 会被压成 0 宽，
-        # 导致左侧预览面板"消失"（看起来只有一个编辑面板）。给定合理尺寸修正。
+        # QWebEngineView 默认 sizeHint 为 0x0，放进布局会被压成 0 宽，
+        # 导致预览面板"消失"。给定合理尺寸修正。
         return QSize(560, 700)
 
     def _on_render_error(self, msg):
@@ -133,19 +137,9 @@ class MainWindow(QMainWindow):
         info.addWidget(self.lbl_count, 0)
         root.addLayout(info)
 
-        splitter = QSplitter(Qt.Horizontal)
         self.view = MarkdownView()
         self.view.sentenceClicked.connect(self.on_sentence_clicked)
-        splitter.addWidget(self.view)
-
-        self.preview = QPlainTextEdit()
-        self.preview.setReadOnly(True)
-        self.preview.setFont(QFont("Consolas", 10))
-        splitter.addWidget(self.preview)
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 2)
-        splitter.setSizes([720, 480])  # 显式初始分栏，避免左侧 WebEngine 视图被压成 0 宽
-        root.addWidget(splitter, 1)
+        root.addWidget(self.view, 1)
 
         ctrl = QFrame()
         ctrl.setFrameShape(QFrame.StyledPanel)
@@ -162,12 +156,12 @@ class MainWindow(QMainWindow):
         row1.addWidget(QLabel("  语速:"))
         self.slider_rate = QSlider(Qt.Horizontal)
         self.slider_rate.setRange(-50, 100)
-        self.slider_rate.setValue(20)
+        self.slider_rate.setValue(40)
         self.slider_rate.setTickPosition(QSlider.TicksBelow)
         self.slider_rate.setFixedWidth(220)
         self.slider_rate.valueChanged.connect(self.on_rate_changed)
         row1.addWidget(self.slider_rate)
-        self.lbl_rate = QLabel("+20%")
+        self.lbl_rate = QLabel("+40%")
         self.lbl_rate.setFixedWidth(48)
         row1.addWidget(self.lbl_rate)
         row1.addStretch(1)
@@ -256,7 +250,6 @@ class MainWindow(QMainWindow):
         self._render_view()
         self.lbl_file.setText(f"📄 {os.path.basename(path)}")
         self.lbl_count.setText(f"共 {len(self.units)} 句")
-        self.preview.setPlainText(text)
         self.current_idx = -1
         self.player.stop()
         self._reset_buttons()
@@ -297,7 +290,7 @@ class MainWindow(QMainWindow):
         self.btn_pause.setEnabled(True)  # 在线 / 本地模式均支持暂停
         self.btn_pause.setText("⏸ 暂停")
         if engine == 'local':
-            self.lbl_status.setText("本地模式：语速/音色下一句生效，暂停即停当前句")
+            self.lbl_status.setText("本地模式：语速/音色下一句生效")
         else:
             self.lbl_status.setText("就绪")
 
@@ -381,7 +374,10 @@ def main():
     # QtWebEngine 官方建议：创建 QApplication 前设置此属性，避免 OpenGL 上下文问题
     QApplication.setAttribute(Qt.AA_ShareOpenGLContexts, True)
     app = QApplication(sys.argv)
-    app.setFont(QFont("Microsoft YaHei", 10))
+    # 设置应用名/组织名，使 QtWebEngine 缓存目录规范化（避免用脚本名当目录）
+    app.setApplicationName("MDReader")
+    app.setOrganizationName("MDReader")
+    app.setFont(QFont(_UI_FONT, 10))
     win = MainWindow()
     win.show()
     sys.exit(app.exec_())

@@ -12,10 +12,12 @@ env/
 
 # ===== PyInstaller / 构建产物 =====
 build/
-# 打包出的 exe 是二进制产物，通常不入库；若你想直接分发 exe，把这行删掉即可
+# 打包出的 .app 是二进制产物，通常不入库；若你想直接分发 .app，把这行删掉即可
 dist/
 *.spec
 *.manifest
+# PyInstaller 缓存目录（build.sh 用 PYINSTALLER_CONFIG_DIR 重定向到项目内）
+.pyinstaller-cache/
 
 # ===== 编辑器 / IDE =====
 .vscode/
