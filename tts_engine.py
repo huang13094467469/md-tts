@@ -19,6 +19,8 @@ import time
 import edge_tts
 from PyQt5.QtCore import QThread, pyqtSignal
 
+from app_logger import logger
+
 
 # 在线音色（edge-tts）-- 仅保留晓晓一个
 ONLINE_VOICES = [
@@ -147,10 +149,11 @@ class OnlineWorker(BaseWorker):
     PREFETCH_WAIT = 4.0  # 主循环等预合成的最长秒数，超时即降级同步合成
     SYNTH_TIMEOUT = 25.0  # 单句 edge-tts 合成的超时秒数，防止网络挂起卡死线程
 
-    def __init__(self, units, voice, rate_pct, start_index=0):
+    def __init__(self, units, voice, rate_pct, start_index=0, source_path=None):
         super().__init__(units, start_index)
         self.voice = voice
         self.rate_pct = rate_pct
+        self.source_path = source_path  # 当前文档路径，用于 TTS 缓存索引
         self._cmd = None
         self._loop = None
         # 预合成缓冲（受 self._cond 保护）
@@ -180,6 +183,15 @@ class OnlineWorker(BaseWorker):
     def _gen_audio(self, loop, text, voice=None, rate_pct=None):
         voice = self.voice if voice is None else voice
         rate_pct = self.rate_pct if rate_pct is None else rate_pct
+        # 1. 查 TTS 磁盘缓存（循环阅读时避免重复合成）
+        try:
+            from tts_cache import get as cache_get
+            cached = cache_get(voice, rate_pct, text)
+            if cached:
+                return cached
+        except Exception:
+            pass
+        # 2. 未命中，调 edge-tts 合成
         rate = f"{rate_pct:+d}%" if rate_pct else "+0%"
         comm = edge_tts.Communicate(text, voice, rate=rate)
         buf = io.BytesIO()
@@ -198,7 +210,14 @@ class OnlineWorker(BaseWorker):
 
         loop.run_until_complete(_run())
         buf.seek(0)
-        return buf.read()
+        audio = buf.read()
+        # 3. 写入缓存（记录来源路径，便于按文件清理）
+        try:
+            from tts_cache import put as cache_put
+            cache_put(voice, rate_pct, text, audio, source_path=self.source_path)
+        except Exception:
+            pass
+        return audio
 
     # ---------------- 预合成后台线程 ----------------
     def _prep_loop(self):
@@ -312,6 +331,13 @@ class OnlineWorker(BaseWorker):
         return None
 
     def run(self):
+        try:
+            self._run_impl()
+        except Exception as e:
+            logger.exception("OnlineWorker 崩溃")
+            self.sig_error.emit(f"播放线程崩溃：{e}")
+
+    def _run_impl(self):
         import pygame
         try:
             pygame.mixer.pre_init(frequency=24000, size=-16, channels=1, buffer=4096)
@@ -321,6 +347,7 @@ class OnlineWorker(BaseWorker):
             except Exception:
                 pass
         except Exception as e:
+            logger.exception("OnlineWorker pygame 初始化失败")
             self.sig_error.emit(f"音频初始化失败：{e}")
             return
 
@@ -356,6 +383,7 @@ class OnlineWorker(BaseWorker):
             try:
                 audio = self._take_audio(idx, text)
             except Exception as e:
+                logger.error("OnlineWorker 第%d句合成失败: %s", idx + 1, e)
                 self.sig_error.emit(f"第{idx+1}句生成失败：{e}")
                 self._stop = True
                 with self._cond:
@@ -381,6 +409,7 @@ class OnlineWorker(BaseWorker):
                         return
                     self.msleep(50)
             except Exception as e:
+                logger.exception("OnlineWorker 播放失败 第%d句", idx + 1)
                 self.sig_error.emit(f"播放失败：{e}")
                 self._stop = True
                 with self._cond:
@@ -457,14 +486,23 @@ class LocalWorker(BaseWorker):
 
     def run(self):
         try:
+            self._run_impl()
+        except Exception as e:
+            logger.exception("LocalWorker 崩溃")
+            self.sig_error.emit(f"播放线程崩溃：{e}")
+
+    def _run_impl(self):
+        try:
             import comtypes.client
         except Exception as e:
+            logger.exception("LocalWorker comtypes 加载失败")
             self.sig_error.emit(f"本地语音组件缺失（需 comtypes）：{e}")
             return
 
         try:
             voice = comtypes.client.CreateObject("SAPI.SpVoice")
         except Exception as e:
+            logger.exception("LocalWorker SAPI.SpVoice 创建失败")
             self.sig_error.emit(f"本地语音初始化失败（系统可能无语音包）：{e}")
             return
 
@@ -698,14 +736,24 @@ class MacWorker(BaseWorker):
 
     def run(self):
         try:
+            self._run_impl()
+        except Exception as e:
+            logger.exception("MacWorker 崩溃")
+            self.sig_error.emit(f"播放线程崩溃：{e}")
+
+    def _run_impl(self):
+        try:
             import AVFoundation as av  # noqa: F401
         except Exception as e:
+            logger.exception("MacWorker AVFoundation 加载失败")
             self.sig_error.emit(f"macOS 语音组件加载失败（需 pyobjc-framework-AVFoundation）：{e}")
             return
 
         try:
             self._synth, self._delegate = self._make_synth()
+            logger.info("MacWorker synth 创建成功")
         except Exception as e:
+            logger.exception("MacWorker synth 初始化失败")
             self.sig_error.emit(f"本地语音初始化失败：{e}")
             return
 
@@ -762,10 +810,11 @@ class TTSPlayer:
         self.engine_type = None
 
     def start(self, engine_type, units, voice, rate, start_index=0,
-              on_current=None, on_status=None, on_finished=None, on_error=None):
+              on_current=None, on_status=None, on_finished=None, on_error=None,
+              source_path=None):
         self.stop()
         if engine_type == 'online':
-            w = OnlineWorker(units, voice, rate, start_index)
+            w = OnlineWorker(units, voice, rate, start_index, source_path=source_path)
         elif IS_MAC:
             w = MacWorker(units, voice, rate, start_index)
         else:
@@ -790,13 +839,21 @@ class TTSPlayer:
         if self.worker and hasattr(self.worker, 'set_params'):
             self.worker.set_params(**kw)
 
-    def stop(self):
+    def stop(self, timeout=1.5, force=True):
+        """停止当前 Worker。
+
+        - timeout: 等 Worker 退出的最长秒数；超时即返回（不卡调用方）
+        - force:   超时后是否 terminate() 强杀线程。
+                   退出 App 时传 force=False，让 daemon 预合成线程随进程自然清理，
+                   避免 terminate() 在 Mac 上残留 AVSpeechSynthesizer / pygame 资源。
+        """
         if self.worker and self.worker.isRunning():
             self.worker.stop()
-            self.worker.wait(1500)
-            try:
-                self.worker.terminate()
-            except Exception:
-                pass
+            self.worker.wait(int(timeout * 1000))
+            if force:
+                try:
+                    self.worker.terminate()
+                except Exception:
+                    pass
         self.worker = None
         self.engine_type = None
