@@ -163,9 +163,7 @@ class MainWindow(QMainWindow):
 
         menubar = self.menuBar()
         file_menu = menubar.addMenu("文件")
-        open_act = file_menu.addAction("打开 MD/MDX 文件")
-        open_act.triggered.connect(self.open_file)
-        open_dir_act = file_menu.addAction("打开 MD 目录")
+        open_dir_act = file_menu.addAction("打开 MD/MDX 目录")
         open_dir_act.triggered.connect(self.open_dir)
         file_menu.addSeparator()
         quit_act = QAction("退出", self)
@@ -461,14 +459,6 @@ class MainWindow(QMainWindow):
         name, ok = QInputDialog.getItem(self, "选择 MD 文件", "工作区文件:", names, 0, False)
         if ok:
             self.open_path(md_files[names.index(name)])
-
-    def open_file(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "打开 Markdown 文件", self._last_dir(),
-            "Markdown / MDX (*.md *.mdx);;Markdown (*.md);;MDX (*.mdx);;All (*.*)")
-        if path:
-            self._save_last_dir(path)
-            self.open_path(path)
 
     def open_path(self, path):
         logger.info("加载文件: %s", path)
