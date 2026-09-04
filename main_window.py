@@ -4,6 +4,7 @@
 预览区使用 QWebEngineView（Chromium 内核），标准 markdown 渲染、图片自适应不跳动；
 点击句子通过自定义 mdtts:N 协议回传 Python，当前句高亮由前端 JS 完成。
 """
+import logging
 import os
 import sys
 import threading
@@ -16,12 +17,12 @@ os.environ.setdefault('QTWEBENGINE_DISABLE_SANDBOX', '1')
 IS_MAC = sys.platform == 'darwin'
 _UI_FONT = 'PingFang SC' if IS_MAC else 'Microsoft YaHei'
 
-from PyQt5.QtCore import Qt, QUrl, QSize, pyqtSignal, QTimer, QSettings
+from PyQt5.QtCore import Qt, QUrl, QSize, QObject, pyqtSignal, QTimer, QSettings
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QSlider, QLabel, QFileDialog, QMessageBox, QAction,
     QSplitter, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
-    QFrame, QPushButton, QInputDialog, QCheckBox, QDialog,
+    QFrame, QPushButton, QInputDialog, QCheckBox, QDialog, QPlainTextEdit,
     QVBoxLayout as QVBoxLayout2, QListWidget as QListWidget2,
     QPushButton as QPushButton2, QDialogButtonBox,
 )
@@ -36,6 +37,28 @@ from app_logger import logger
 
 # 左侧树中用于标记「文档叶子节点」的 data role（目录节点不设此标记）
 _FILE_ROLE = Qt.UserRole + 1
+
+
+# =========================================================================
+# 运行日志 -> GUI 桥接：把 logging（含工作线程）转发到主线程的日志面板。
+# logging 的 emit 可能在任意 QThread 里触发；PyQt 信号默认 QueuedConnection，
+# 跨线程 emit 会自动排队到主线程事件循环，天然线程安全。
+# =========================================================================
+class _LogBridge(QObject):
+    newLog = pyqtSignal(str)
+
+
+_log_bridge = _LogBridge()
+
+
+class _GuiLogHandler(logging.Handler):
+    """把每条日志格式化后经信号转发给 GUI（主线程）。"""
+
+    def emit(self, record):
+        try:
+            _log_bridge.newLog.emit(self.format(record))
+        except Exception:
+            pass
 
 
 class _Page(QWebEnginePage):
@@ -122,6 +145,16 @@ class MainWindow(QMainWindow):
         self._doc_order = []  # 打开目录后树中所有文档的阅读顺序（绝对路径列表）
         self._init_ui()
         self._init_voices()
+        self._setup_gui_log()
+
+    # ---------------- GUI 日志接管 ----------------
+    def _setup_gui_log(self):
+        """把全局 logger 接到 GUI 日志面板（跨线程安全）。"""
+        handler = _GuiLogHandler()
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s", "%H:%M:%S"))
+        _log_bridge.newLog.connect(self._append_log)
+        logger.addHandler(handler)
 
     # ---------------- UI ----------------
     def _init_ui(self):
@@ -231,7 +264,56 @@ class MainWindow(QMainWindow):
         row2.addWidget(self.lbl_status)
         cl.addLayout(row2)
 
+        # 可折叠运行日志面板
+        row3 = QHBoxLayout()
+        self.btn_log_toggle = QPushButton("▸ 运行日志")
+        self.btn_log_toggle.setCheckable(True)
+        self.btn_log_toggle.setChecked(False)
+        self.btn_log_toggle.setFlat(True)
+        self.btn_log_toggle.setStyleSheet("QPushButton{border:none; color:#555; font-weight:bold;} "
+                                          "QPushButton:hover{color:#0969da;}")
+        self.btn_log_toggle.clicked.connect(self._toggle_log_panel)
+        row3.addWidget(self.btn_log_toggle)
+        row3.addStretch(1)
+        self.btn_log_clear = QPushButton("清空")
+        self.btn_log_clear.setFixedHeight(22)
+        self.btn_log_clear.setEnabled(False)
+        self.btn_log_clear.clicked.connect(lambda: self._log_edit.clear())
+        row3.addWidget(self.btn_log_clear)
+        cl.addLayout(row3)
+
+        self._log_edit = QPlainTextEdit()
+        self._log_edit.setReadOnly(True)
+        self._log_edit.setMaximumHeight(180)
+        self._log_edit.setStyleSheet(
+            "QPlainTextEdit{background:#f6f8fa; color:#24292f; border:1px solid #d0d7de;"
+            "border-radius:4px; font-family:Consolas,'Courier New',monospace; font-size:12px;}")
+        self._log_edit.setVisible(False)
+        cl.addWidget(self._log_edit)
+
         root.addWidget(ctrl)
+
+    # ---------------- 日志面板 ----------------
+    def _toggle_log_panel(self):
+        show = self.btn_log_toggle.isChecked()
+        self._log_edit.setVisible(show)
+        self.btn_log_toggle.setText("▾ 运行日志" if show else "▸ 运行日志")
+        if show:
+            self._log_edit.verticalScrollBar().setValue(
+                self._log_edit.verticalScrollBar().maximum())
+
+    def _append_log(self, text):
+        self._log_edit.appendPlainText(text)
+        # 限制面板行数，避免长时间运行占用过多内存
+        if self._log_edit.document().blockCount() > 2000:
+            cursor = self._log_edit.textCursor()
+            cursor.select(cursor.Document)
+            cursor.removeSelectedText()
+        self.btn_log_clear.setEnabled(True)
+        # 面板展开时自动滚到底部，否则只记录不干扰
+        if self._log_edit.isVisible():
+            self._log_edit.verticalScrollBar().setValue(
+                self._log_edit.verticalScrollBar().maximum())
 
     # ---------------- 音色列表 ----------------
     def _init_voices(self):
