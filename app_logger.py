@@ -18,11 +18,18 @@ _APP_NAME = "MDReader"
 
 
 def _log_dir():
-    """返回日志目录，优先用 macOS 标准位置 ~/Library/Logs/<APP>/。"""
+    """返回日志目录。
+    macOS  : ~/Library/Logs/<APP>/（系统标准位置）
+    Windows: %LOCALAPPDATA%/<APP>/（打包入 Program Files 时 exe 同目录不可写）
+    其他    : 可执行文件同目录（开发期）回退到当前目录
+    """
     if sys.platform == 'darwin':
         base = os.path.expanduser('~/Library/Logs')
+    elif sys.platform == 'win32':
+        # LOCALAPPDATA 形如 C:\Users\<user>\AppData\Local，Win2000+ 均存在
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
     else:
-        # 打包后 sys.executable 指向 .exe；开发期指 .py，回退到脚本目录
+        # 打包后 sys.executable 指向可执行文件；开发期指 .py，回退到脚本目录
         base = os.path.dirname(os.path.abspath(sys.executable))
         if not os.path.isdir(base):
             base = os.getcwd()

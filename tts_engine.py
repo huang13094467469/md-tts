@@ -485,11 +485,29 @@ class LocalWorker(BaseWorker):
             pass
 
     def run(self):
+        # SAPI.SpVoice 是 STA COM 对象；QThread 子线程默认未初始化 COM，
+        # 需先 CoInitialize 再创建/调用，否则 CreateObject 抛
+        # "CoInitialize has not been called"。线程结束前 CoUninitialize。
+        com_inited = False
+        if IS_WIN:
+            try:
+                import ctypes
+                ctypes.windll.ole32.CoInitialize(None)
+                com_inited = True
+            except Exception:
+                pass
         try:
             self._run_impl()
         except Exception as e:
             logger.exception("LocalWorker 崩溃")
             self.sig_error.emit(f"播放线程崩溃：{e}")
+        finally:
+            if com_inited:
+                try:
+                    import ctypes
+                    ctypes.windll.ole32.CoUninitialize()
+                except Exception:
+                    pass
 
     def _run_impl(self):
         try:

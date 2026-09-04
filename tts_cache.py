@@ -4,7 +4,9 @@
 在线引擎 edge-tts 合成较慢且耗流量，循环阅读时重复合成浪费资源。
 本模块按 (voice, rate, 文本) 哈希缓存合成结果到磁盘，未命中才合成。
 
-缓存目录：~/Library/Caches/MDReader/tts/
+缓存目录：
+  - macOS  : ~/Library/Caches/MDReader/tts/
+  - Windows: %LOCALAPPDATA%/MDReader/tts/（打包入 Program Files 时 exe 同目录不可写）
 索引文件：index.json 记录 {文件绝对路径: [缓存key列表]}，用于按文件清理。
 
 缓存 key = sha256(voice + rate + text) 的前 32 字符，避免文件名过长。
@@ -22,6 +24,9 @@ _lock = threading.Lock()
 def _cache_dir():
     if sys.platform == 'darwin':
         base = os.path.expanduser('~/Library/Caches')
+    elif sys.platform == 'win32':
+        # 打包入 Program Files 时 exe 同目录不可写，用用户本地应用数据目录
+        base = os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')
     else:
         base = os.path.dirname(os.path.abspath(sys.executable))
     d = os.path.join(base, _APP_NAME, 'tts')

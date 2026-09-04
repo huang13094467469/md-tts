@@ -20,8 +20,9 @@ from PyQt5.QtCore import Qt, QUrl, QSize, pyqtSignal, QTimer, QSettings
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QComboBox, QSlider, QLabel, QFileDialog, QMessageBox, QAction,
-    QSplitter, QListWidget, QListWidgetItem, QFrame, QPushButton, QInputDialog,
-    QCheckBox, QDialog, QVBoxLayout as QVBoxLayout2, QListWidget as QListWidget2,
+    QSplitter, QListWidget, QListWidgetItem, QTreeWidget, QTreeWidgetItem,
+    QFrame, QPushButton, QInputDialog, QCheckBox, QDialog,
+    QVBoxLayout as QVBoxLayout2, QListWidget as QListWidget2,
     QPushButton as QPushButton2, QDialogButtonBox,
 )
 from PyQt5.QtGui import QFont, QKeySequence
@@ -31,6 +32,10 @@ from md_parser import parse_markdown, parse_to_blocks, preprocess_mdx
 from markdown_render import render_markdown
 from tts_engine import TTSPlayer, get_local_chinese_voice
 from app_logger import logger
+
+
+# 左侧树中用于标记「文档叶子节点」的 data role（目录节点不设此标记）
+_FILE_ROLE = Qt.UserRole + 1
 
 
 class _Page(QWebEnginePage):
@@ -114,6 +119,7 @@ class MainWindow(QMainWindow):
         self._md_dir = ''
         self._current_path = ''  # 当前文档绝对路径，用于 TTS 缓存与连续阅读跳转
         self._user_stopped = False  # 用户主动停止标志，避免自然读完时误触发跳转
+        self._doc_order = []  # 打开目录后树中所有文档的阅读顺序（绝对路径列表）
         self._init_ui()
         self._init_voices()
 
@@ -152,22 +158,24 @@ class MainWindow(QMainWindow):
         info.addWidget(self.lbl_count, 0)
         root.addLayout(info)
 
-        # 左右分栏：左侧文档列表，右侧 Markdown 渲染预览
+        # 左右分栏：左侧树形文档列表，右侧 Markdown 渲染预览
         splitter = QSplitter(Qt.Horizontal)
-        self.doc_list = QListWidget()
-        self.doc_list.setFixedWidth(240)
-        self.doc_list.setStyleSheet("QListWidget{font-size:13px;} "
-                                    "QListWidget::item{padding:6px 8px;} "
-                                    "QListWidget::item:selected{background:#ddf4ff;color:#0969da;}")
-        self.doc_list.itemClicked.connect(self.on_doc_selected)
-        splitter.addWidget(self.doc_list)
+        self.doc_tree = QTreeWidget()
+        self.doc_tree.setHeaderHidden(True)
+        self.doc_tree.setFixedWidth(260)
+        self.doc_tree.setStyleSheet(
+            "QTreeWidget{font-size:13px;} "
+            "QTreeWidget::item{padding:4px 6px;} "
+            "QTreeWidget::item:selected{background:#ddf4ff;color:#0969da;}")
+        self.doc_tree.itemClicked.connect(self.on_doc_selected)
+        splitter.addWidget(self.doc_tree)
 
         self.view = MarkdownView()
         self.view.sentenceClicked.connect(self.on_sentence_clicked)
         splitter.addWidget(self.view)
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
-        splitter.setSizes([240, 960])
+        splitter.setSizes([260, 940])
         root.addWidget(splitter, 1)
 
         ctrl = QFrame()
@@ -260,47 +268,104 @@ class MainWindow(QMainWindow):
             if d and os.path.isdir(d):
                 QSettings().setValue('lastOpenDir', d)
 
+    def on_doc_selected(self, item):
+        """点击左侧树形列表项：若是文档叶子，渲染对应文档。
+        （目录节点仅用于展开，点击不加载。）
+        """
+        if item is None:
+            return
+        if not item.data(0, _FILE_ROLE):  # 目录节点（未标记为文件）
+            return
+        path = item.data(0, Qt.UserRole)
+        if path:
+            logger.info("选择文档: %s", path)
+            self.open_path(path)
+
     def open_dir(self):
-        """选择一个目录，扫描其中的 .md/.mdx（含子目录）填入左侧文档列表。"""
+        """选择一个目录，按其子目录结构构建左侧树；文档叶子按目录分组的顺序排列。"""
         path = QFileDialog.getExistingDirectory(self, "打开 Markdown 目录", self._last_dir())
         if not path:
             return
         self._save_last_dir(path)
         logger.info("打开目录: %s", path)
-        # 递归收集 .md / .mdx
-        md_files = []
-        for root, _dirs, files in os.walk(path):
-            for n in files:
-                if n.lower().endswith(('.md', '.mdx')):
-                    md_files.append(os.path.join(root, n))
-        if not md_files:
+        self.doc_tree.clear()
+        self._doc_order = []
+        abspath = os.path.abspath(path)
+        root_item = QTreeWidgetItem([os.path.basename(abspath) or abspath])
+        self.doc_tree.addTopLevelItem(root_item)
+        root_item.setExpanded(True)
+        n = self._populate_tree(root_item, abspath)
+        if n == 0:
             logger.warning("目录下未找到 .md/.mdx: %s", path)
+            self.doc_tree.clear()
             QMessageBox.information(self, "提示", "该目录下未找到 .md / .mdx 文件")
             return
-        md_files.sort(key=lambda p: os.path.basename(p).lower())
-        logger.info("扫描到 %d 个文档", len(md_files))
+        logger.info("扫描到 %d 个文档", n)
+        # 默认选中第一个文档并渲染
+        if self._doc_order:
+            self._select_tree_node(self._doc_order[0])
+            self.open_path(self._doc_order[0])
 
-        # 填充左侧列表
-        self.doc_list.clear()
-        for f in md_files:
-            name = os.path.splitext(os.path.basename(f))[0]
-            item = QListWidgetItem(name)
-            item.setToolTip(f)  # 鼠标悬停显示完整路径
-            item.setData(Qt.UserRole, f)
-            self.doc_list.addItem(item)
-        # 默认选中第一个并渲染
-        self.doc_list.setCurrentRow(0)
-        if self.doc_list.count() > 0:
-            self.on_doc_selected(self.doc_list.item(0))
+    def _populate_tree(self, node, abspath):
+        """递归把 abspath 下的子目录与 .md/.mdx 文档填入 node，返回文档计数。
 
-    def on_doc_selected(self, item):
-        """点击左侧列表项：渲染对应文档（复用 open_path，朗读/暂停/停止逻辑不变）。"""
-        if item is None:
-            return
-        path = item.data(Qt.UserRole)
-        if path:
-            logger.info("选择文档: %s", path)
-            self.open_path(path)
+        目录在前、文件在后，各自按名称排序；空的子目录会被移除。树的前序遍历
+        顺序同时写入 self._doc_order，作为连续阅读的阅读顺序。
+        """
+        count = 0
+        try:
+            entries = sorted(os.scandir(abspath),
+                             key=lambda e: (not e.is_dir(), e.name.lower()))
+        except OSError:
+            return 0
+        # 用系统风格内置图标区分文件夹与文件（QStyle 提供，无需打包额外资源）
+        style = QApplication.style()
+        io_dir = style.standardIcon(style.SP_DirIcon)
+        io_file = style.standardIcon(style.SP_FileIcon)
+        for e in entries:
+            if e.name.startswith('.'):
+                continue
+            full = os.path.abspath(e.path)
+            if e.is_dir():
+                sub = QTreeWidgetItem([e.name])
+                sub.setIcon(0, io_dir)  # 文件夹：专用图标
+                sub.setData(0, Qt.UserRole, full)
+                node.addChild(sub)
+                c = self._populate_tree(sub, full)
+                if c == 0:
+                    node.removeChild(sub)  # 无文档的空目录，不展示
+                else:
+                    count += c
+            elif e.name.lower().endswith(('.md', '.mdx')):
+                # 文件节点显示完整文件名（含扩展名），与文件夹在名称与图标上区分
+                it = QTreeWidgetItem([e.name])
+                it.setIcon(0, io_file)  # 文件：专用图标
+                it.setData(0, Qt.UserRole, full)
+                it.setData(0, _FILE_ROLE, True)  # 标记为可加载的文档叶子
+                it.setToolTip(0, full)
+                node.addChild(it)
+                self._doc_order.append(full)
+                count += 1
+        return count
+
+    def _select_tree_node(self, path):
+        """在树中定位节点并选中，同时展开到其祖先目录链、滚动到可见。"""
+        stack = [self.doc_tree.topLevelItem(i)
+                 for i in range(self.doc_tree.topLevelItemCount())]
+        while stack:
+            it = stack.pop()
+            if it.data(0, Qt.UserRole) == path:
+                self.doc_tree.blockSignals(True)
+                self.doc_tree.setCurrentItem(it)
+                self.doc_tree.blockSignals(False)
+                p = it.parent()
+                while p:
+                    p.setExpanded(True)
+                    p = p.parent()
+                self.doc_tree.scrollToItem(it)
+                return
+            for c in range(it.childCount()):
+                stack.append(it.child(c))
 
     def load_workspace_md(self):
         parent = os.path.dirname(os.path.abspath(__file__))
@@ -348,19 +413,8 @@ class MainWindow(QMainWindow):
         self.current_idx = -1
         self.player.stop()
         self._reset_buttons()
-        # 同步左侧列表选中状态（不触发 itemClicked，避免重复加载）
-        abspath = os.path.abspath(path)
-        self.doc_list.blockSignals(True)
-        found = False
-        for i in range(self.doc_list.count()):
-            it = self.doc_list.item(i)
-            if it.data(Qt.UserRole) == abspath:
-                self.doc_list.setCurrentRow(i)
-                found = True
-                break
-        if not found:
-            self.doc_list.setCurrentRow(-1)
-        self.doc_list.blockSignals(False)
+        # 同步左侧树选中状态（_select_tree_node 内部已 blockSignals，不会触发重载）
+        self._select_tree_node(os.path.abspath(path))
 
     def _render_view(self):
         if not self._md_text:
@@ -468,13 +522,18 @@ class MainWindow(QMainWindow):
             self._reset_buttons()
             self.lbl_status.setText("已停止")
             return
-        # 连续阅读：跳转下一个文档（读完最后一个回到第一个，整个列表循环）
-        if self.chk_continuous.isChecked() and self.doc_list.count() > 0:
-            cur_row = self.doc_list.currentRow()
-            next_row = (cur_row + 1) % self.doc_list.count()
-            logger.info("连续阅读: %d -> %d", cur_row, next_row)
-            self.lbl_status.setText(f"切换到下一篇…")
-            QTimer.singleShot(800, lambda: self._play_doc_at_row(next_row))
+        # 连续阅读：按树的前序遍历顺序跳到下一篇（读到最后回到第一篇，循环）
+        if self.chk_continuous.isChecked() and len(self._doc_order) > 1:
+            cur_full = (self._current_path or '')
+            try:
+                cur = self._doc_order.index(cur_full)
+            except ValueError:
+                cur = -1
+            next_path = self._doc_order[(cur + 1) % len(self._doc_order)] if cur >= 0 \
+                else self._doc_order[0]
+            logger.info("连续阅读: %s -> %s", cur_full, next_path)
+            self.lbl_status.setText("切换到下一篇…")
+            QTimer.singleShot(800, lambda: self._play_doc_at_path(next_path))
             return
         # 未勾连续阅读：单文件循环，从当前文档开头重新开始
         if self.units:
@@ -485,15 +544,12 @@ class MainWindow(QMainWindow):
         self._reset_buttons()
         self.lbl_status.setText("朗读完成 ✓")
 
-    def _play_doc_at_row(self, row):
-        """切换到列表指定行并从头播放（连续阅读跳转用）。"""
-        if row < 0 or row >= self.doc_list.count():
-            return
-        item = self.doc_list.item(row)
-        if not item:
+    def _play_doc_at_path(self, path):
+        """切换到指定路径的文档并从头播放（连续阅读跳转用）。"""
+        if not path or not os.path.isfile(path):
             return
         # 切换文档（会重新渲染、加载 units）
-        self.on_doc_selected(item)
+        self.open_path(path)
         # 稍延迟启动播放，等文档渲染就绪
         QTimer.singleShot(300, lambda: self._start_playback(0))
 
@@ -529,11 +585,9 @@ class MainWindow(QMainWindow):
         lay.addWidget(QLabel("按文件清理（勾选要清理的文档）："))
         lst = QListWidget2()
         lst.setSelectionMode(QListWidget2.MultiSelection)
-        # 列出当前文档列表中的文件
-        for i in range(self.doc_list.count()):
-            it = self.doc_list.item(i)
-            path = it.data(Qt.UserRole)
-            display = f"{it.text()}  ({path})"
+        # 列出当前打开目录下的全部文档
+        for path in self._doc_order:
+            display = f"{os.path.basename(path)}  ({path})"
             item = QListWidgetItem(display)
             item.setData(Qt.UserRole, path)
             lst.addItem(item)
