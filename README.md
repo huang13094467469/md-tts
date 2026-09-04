@@ -90,9 +90,11 @@ powershell -ExecutionPolicy Bypass -File .\build.ps1
 ## 🗂 项目结构
 
 ```
-main_window.py      主窗口：目录树 + 渲染预览 + 播放控制 + 底部日志面板
+main_window.py      主窗口：目录树 + 渲染预览 + 播放控制 + 日志面板编排
 md_parser.py        Markdown/MDX 解析与句子切分（朗读序列的权威来源）
 markdown_render.py  标准 Markdown 渲染（QWebEngine / pygments）
+markdown_view.py    Markdown 渲染预览视图（QWebEngineView，点击定位/高亮）
+log_panel.py        运行日志 -> GUI 桥接 + 可折叠日志面板
 tts_engine.py       TTS 引擎：在线 edge-tts + 本地 SAPI / AVSpeech 双实现
 tts_cache.py        在线合成音色的磁盘缓存
 app_logger.py       文件日志（RotatingFileHandler）+ 异常兜底
