@@ -29,6 +29,14 @@ dist/
 .DS_Store
 Thumbs.db
 
+# ===== 运行时产物（日志 / 缓存） =====
+app.log
+webengine_error.log
+logs/
+*.log
+
 # ===== 临时 / 回收目录 =====
 _trash*/
 *.bak
+tmp/
+*.tmp

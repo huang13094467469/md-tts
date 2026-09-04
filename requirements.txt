@@ -1,0 +1,21 @@
+# ---- 运行依赖（全平台） ----
+PyQt5>=5.15
+PyQtWebEngine>=5.15
+edge-tts>=6.0
+pygame>=2.1
+Markdown>=3.4
+Pygments>=2.15
+
+# ---- Windows 本地语音引擎（SAPI） ----
+# 如需本地中文语音朗读，安装：
+#   pip install comtypes
+comtypes>=1.2 ; sys_platform == "win32"
+
+# ---- macOS 本地语音引擎（AVSpeechSynthesizer） ----
+# 如需本地中文语音朗读，安装：
+#   pip install pyobjc-framework-AVFoundation
+pyobjc-framework-AVFoundation>=9.0 ; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=9.0 ; sys_platform == "darwin"
+
+# ---- 打包（如需编译成可执行程序） ----
+# pip install pyinstaller
