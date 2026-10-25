@@ -71,6 +71,7 @@ $PY -m PyInstaller \
     --hidden-import Foundation \
     --hidden-import objc \
     --collect-submodules edge_tts \
+    --add-data "assets:assets" \
     "$ENTRY"
 
 APP_PATH="dist/$APP_NAME.app"

@@ -10,7 +10,10 @@
     因此彻底消除 QTextBrowser 时代的「加载即重排 → 滚动条跳动」问题。
 """
 import html
+import os
 import re
+import sys
+from pathlib import Path
 import markdown as _md
 from pygments import highlight
 from pygments.lexers import get_lexer_by_name, TextLexer
@@ -69,7 +72,23 @@ hr{border:none; border-top:1px solid var(--border); margin:20px 0;}
 .s.cur{background:var(--hl);}
 """
 
+_GITHUB_CSS += """
+pre.mermaid{background:#fff; border:1px solid var(--border); border-radius:8px;
+            margin:0 0 14px; padding:12px; overflow:auto;}
+pre.mermaid svg{max-width:100%; height:auto;}
+.mermaid-error{color:#cf222e; white-space:pre-wrap;}
+"""
+
+
+def _asset_url(*parts):
+    """返回随程序发布的静态资源 file URL（兼容 PyInstaller）。"""
+    root = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return Path(root, *parts).resolve().as_uri()
+
+
+_MERMAID_URL = _asset_url('assets', 'mermaid', 'mermaid.min.js')
 _CSS = '<style>' + _PYG_CSS + '\n' + _GITHUB_CSS + '</style>'
+_MERMAID_SCRIPT = '<script src="%s"></script>' % html.escape(_MERMAID_URL, quote=True)
 
 _JS = """
 <script>
@@ -83,6 +102,19 @@ function clearHighlight(){
   var old = document.querySelectorAll('.s.cur');
   for(var k=0;k<old.length;k++) old[k].classList.remove('cur');
 }
+window.addEventListener('load', function(){
+  if(!window.mermaid) return;
+  mermaid.initialize({startOnLoad:false, securityLevel:'strict'});
+  mermaid.run({nodes:document.querySelectorAll('pre.mermaid')}).catch(function(error){
+    console.error('Mermaid rendering failed:', error);
+    var nodes=document.querySelectorAll('pre.mermaid');
+    for(var i=0;i<nodes.length;i++){
+      if(nodes[i].querySelector('svg')) continue;
+      nodes[i].classList.add('mermaid-error');
+      nodes[i].title='Mermaid 图表语法错误；请查看开发者控制台获取详情。';
+    }
+  });
+});
 </script>
 """
 
@@ -122,7 +154,7 @@ def render_markdown(blocks, base_dir=''):
     base_dir 用于解析相对图片路径，并作为 setHtml 的 baseUrl。
     每句可朗读文本包 <span class="s" data-idx="N">，N 与 parse_markdown 对齐。
     """
-    out = ['<html><head><meta charset="utf-8">', _CSS, _JS, '</head><body>']
+    out = ['<html><head><meta charset="utf-8">', _CSS, _MERMAID_SCRIPT, _JS, '</head><body>']
     idx = 0
     i = 0
     n = len(blocks)
@@ -199,10 +231,15 @@ def render_markdown(blocks, base_dir=''):
 
         elif t == 'code':
             code = '\n'.join(b['lines'])
-            lang = b.get('lang', '')
-            lang_html = '<div class="codelang">%s</div>' % html.escape(lang) if lang else ''
-            out.append('<div class="codeblock">%s%s</div>'
-                       % (lang_html, _render_code(code, lang)))
+            lang = b.get('lang', '').strip()
+            if lang.lower() == 'mermaid':
+                # Mermaid 接收未被 Markdown/Pygments 改写的源码；HTML 转义避免
+                # 用户文档中的标签被当作页面脚本执行。
+                out.append('<pre class="mermaid">%s</pre>' % html.escape(code))
+            else:
+                lang_html = '<div class="codelang">%s</div>' % html.escape(lang) if lang else ''
+                out.append('<div class="codeblock">%s%s</div>'
+                           % (lang_html, _render_code(code, lang)))
             i += 1
 
         elif t == 'hr':

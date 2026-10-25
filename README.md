@@ -10,7 +10,7 @@
 
   - 本地：本机系统中文语音（离线、零延迟；Windows 用 SAPI，macOS 用 AVSpeechSynthesizer）
 
-- **标准 Markdown / MDX 渲染**：GitHub 风格主题、代码高亮（pygments）、图片自适应不跳动
+- **标准 Markdown / MDX 渲染**：GitHub 风格主题、代码高亮（pygments）、图片自适应不跳动，支持 Mermaid 图表（离线渲染）
 
 - **点击定位朗读**：点击任意句子即可从该句开始朗读，当前句高亮
 

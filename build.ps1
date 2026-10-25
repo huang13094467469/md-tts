@@ -118,6 +118,7 @@ if ($CondaLibBin) {
     --hidden-import comtypes `
     --collect-submodules edge_tts `
     --collect-submodules comtypes `
+    --add-data "assets;assets" `
     @binArgs `
     $ENTRY
 if ($LASTEXITCODE -ne 0) {

@@ -40,3 +40,6 @@ _trash*/
 *.bak
 tmp/
 *.tmp
+
+# ===== 临时构建实验目录 =====
+.mermaid-build-test-*/
